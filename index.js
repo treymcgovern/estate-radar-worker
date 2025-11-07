@@ -1,103 +1,107 @@
-// index.js — fetch real listings and upsert into Supabase (debug build)
-
-// ---- loud global error handlers -------------------------------------------
-process.on('unhandledRejection', (err) => {
-  console.error('[FATAL] Unhandled Promise rejection:', err && err.stack || err);
-  process.exit(1);
-});
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL] Uncaught exception:', err && err.stack || err);
-  process.exit(1);
-});
-
-console.log('== Worker booting ==', new Date().toISOString());
+// index.js — fetch real listings and upsert into Supabase (with verbose logging)
 
 const { createClient } = require('@supabase/supabase-js');
 const dayjs = require('dayjs');
 const { searchEstateSalesNet } = require('./sources/estatesalesnet');
 
-// ---- env helpers -----------------------------------------------------------
 function need(name) {
   const v = process.env[name];
-  if (!v) {
-    console.error(`[ENV] Missing env var: ${name}`);
-    throw new Error(`Missing env var: ${name}`);
-  }
+  if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
-// ---- config/env ------------------------------------------------------------
 const SUPABASE_URL = need('SUPABASE_URL');
 const SERVICE_KEY  = need('SUPABASE_SERVICE_ROLE_KEY');
 const supabase = createClient(SUPABASE_URL, SERVICE_KEY);
 
-// run configuration
+// ---- config for this run ----
 const ZIP       = '93552';
 const RADIUS_MI = 50;
 const HOME_BASE = '36304 52nd St E, Palmdale, CA 93552';
 
-// ---- db helpers ------------------------------------------------------------
+// ---- helpers ---------------------------------------------------------------
 async function logRun(status, notes) {
   try {
-    await supabase.from('runs').insert({
-      status,
-      notes,
-      started_at: new Date().toISOString()
-    });
-  } catch (e) {
-    console.error('[runs] insert failed:', e);
+    await supabase.from('runs').insert({ status, notes });
+  } catch (err) {
+    console.error('[runs] insert failed:', err.message);
   }
 }
 
+function pretty(obj) {
+  return JSON.stringify(obj, null, 2);
+}
+
 // ---- main ------------------------------------------------------------------
-(async function main() {
-  console.log('[main] starting run…');
-  const startedAt = Date.now();
+(async () => {
+  console.log('=== Worker starting at', new Date().toISOString(), '===');
+  console.log('Config:', { ZIP, RADIUS_MI, HOME_BASE });
+
+  await logRun('starting', `zip=${ZIP}, radius=${RADIUS_MI}`);
+
+  let results;
+  try {
+    results = await searchEstateSalesNet({
+      zip: ZIP,
+      radiusMiles: RADIUS_MI,
+      homeBase: HOME_BASE,
+      maxPages: 1,          // you can bump this later
+      fetchTimeoutMs: 20000 // safety timeout
+    });
+  } catch (err) {
+    console.error('[fetch] failed:', err.stack || err.message || err);
+    await logRun('error', `fetch failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  if (!results || !Array.isArray(results) || results.length === 0) {
+    console.warn('[fetch] no listings returned');
+    await logRun('done', '0 listings (no-op)');
+    console.log('=== Worker done (no data) ===');
+    process.exit(0);
+  }
+
+  console.log(`[fetch] got ${results.length} raw listings`);
+  // Normalize rows for Supabase
+  const rows = results.map((r) => {
+    return {
+      title: r.title || null,
+      address: r.address || null,
+      city: r.city || null,
+      state: r.state || null,
+      zip: r.zip || null,
+      lat: r.lat ?? null,
+      lng: r.lng ?? null,
+      distance_mi: r.distanceMi ?? null,
+      hours_json: r.hours ? JSON.stringify(r.hours) : null,
+      starts_at: r.startsAt ? new Date(r.startsAt).toISOString() : null,
+      ends_at: r.endsAt ? new Date(r.endsAt).toISOString() : null,
+      directions_url: r.directionsUrl || null,
+      source: 'estatesales.net',
+      source_id: r.sourceId || null,
+      created_at: new Date().toISOString()
+    };
+  });
+
+  console.log(`[upsert] preparing to upsert ${rows.length} rows`);
+  // Show a small sample to verify shape
+  console.log('[upsert] sample row:', pretty(rows[0]));
 
   try {
-    // sanity check DB connectivity
-    console.log('[db] ping: selecting 1 from runs…');
-    await supabase.from('runs').select('id').limit(1);
-    console.log('[db] ping ok.');
-
-    // fetch from estatesales.net (scraper/source module)
-    console.log('[fetch] estatesales.net search starting…', { ZIP, RADIUS_MI });
-    const sales = await searchEstateSalesNet({
-      zip: ZIP,
-      radiusMi: RADIUS_MI,
-      homeBase: HOME_BASE
-    });
-
-    const count = Array.isArray(sales) ? sales.length : 0;
-    console.log(`[fetch] got ${count} sales.`);
-
-    if (!Array.isArray(sales)) {
-      throw new Error('searchEstateSalesNet returned non-array result');
-    }
-
-    if (sales.length === 0) {
-      console.warn('[fetch] no results; logging run and exiting.');
-      await logRun('ok', '0 results');
-      console.log('== Worker done (no results) ==', (Date.now() - startedAt) + 'ms');
-      return;
-    }
-
-    // upsert into Supabase
-    console.log('[upsert] writing to supabase…');
+    // upsert on (source, source_id) to avoid duplicates
     const { error } = await supabase
       .from('sales')
-      .upsert(sales, { onConflict: 'id' }); // assumes 'id' is unique key in your table
-    if (error) {
-      console.error('[upsert] error:', error);
-      throw error;
-    }
+      .upsert(rows, { onConflict: 'source,source_id' });
 
-    await logRun('ok', `inserted/upserted ${sales.length}`);
-    console.log('[upsert] done.');
-    console.log('== Worker done (success) ==', (Date.now() - startedAt) + 'ms');
+    if (error) throw error;
+
+    console.log('[upsert] success');
+    await logRun('done', `upserted=${rows.length}`);
+    console.log('=== Worker done OK ===');
+    process.exit(0);
   } catch (err) {
-    console.error('[main] FAILED:', err && err.stack || err);
-    await logRun('error', String(err && err.message || err));
+    console.error('[upsert] failed:', err.stack || err.message || err);
+    await logRun('error', `upsert failed: ${err.message}`);
     process.exit(1);
   }
 })();

@@ -1,131 +1,83 @@
-// sources/estatesalesnet.js
-// Minimal HTML fetcher with defensive parsing + verbose logging.
+// sources/estatesalesnet.js — very simple placeholder scraper with logging
+// Replace this with your real implementation once the pipeline proves out.
 
-const cheerio = require('cheerio');
+const DEFAULT_HEADERS = {
+  // Some sites require a UA; harmless to include for all
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+  'Accept': 'text/html,application/json;q=0.9,*/*;q=0.8'
+};
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-// Build a best-guess search URL for estatesales.net (city/zip + radius)
-function buildUrl({ zip, radiusMi }) {
-  // estatesales.net has multiple routes; this generic search page tends to work:
-  // e.g. https://www.estatesales.net/estate-sales?searchZip=93552&radius=50
-  const u = new URL('https://www.estatesales.net/estate-sales');
-  u.searchParams.set('searchZip', zip);
-  u.searchParams.set('radius', String(radiusMi || 50));
-  return u.toString();
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
 }
 
-async function fetchHtml(url) {
-  const res = await fetch(url, {
-    headers: {
-      'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36',
-      'accept': 'text/html,application/xhtml+xml',
+/**
+ * Return a few mock listings so we can verify the end-to-end pipeline.
+ * When you’re ready, replace this with real HTTP fetch + parse.
+ */
+async function searchEstateSalesNet(opts) {
+  const { zip, radiusMiles, homeBase, maxPages = 1, fetchTimeoutMs = 20000 } = opts || {};
+  console.log('[esn] params:', { zip, radiusMiles, homeBase, maxPages, fetchTimeoutMs });
+
+  // ---- If you already have real fetching/parsing, put it here. ------------
+  // Example shape to return:
+  // [
+  //   {
+  //     title: 'Huge Estate Sale — Palmdale',
+  //     address: '456 Worker Ave',
+  //     city: 'Palmdale',
+  //     state: 'CA',
+  //     zip: '93550',
+  //     lat: 34.58,
+  //     lng: -118.10,
+  //     distanceMi: 4.2,
+  //     hours: { sat: '09:00–15:00' },
+  //     startsAt: '2025-11-08T17:00:00Z',
+  //     endsAt:   '2025-11-08T23:00:00Z',
+  //     directionsUrl: 'https://maps.google.com/?q=456 Worker Ave Palmdale CA',
+  //     sourceId: 'esn-12345'
+  //   }
+  // ]
+
+  // For now, return a short mock array each run so we can see upserts
+  await sleep(500); // small delay to look more “real”
+  const now = Date.now();
+  const base = [
+    {
+      title: 'Railway Worker Test Sale',
+      address: '456 Worker Ave',
+      city: 'Palmdale',
+      state: 'CA',
+      zip: '93550',
+      lat: 34.58,
+      lng: -118.10,
+      distanceMi: 4.2,
+      hours: { sat: '09:00–15:00' },
+      startsAt: new Date(now + 24 * 3600 * 1000).toISOString(),
+      endsAt:   new Date(now + 24 * 3600 * 1000 + 6 * 3600 * 1000).toISOString(),
+      directionsUrl: 'https://www.google.com/maps?q=456+Worker+Ave,+Palmdale,+CA+93550',
+      sourceId: 'esn-mock-001'
     },
-  });
-  if (!res.ok) {
-    throw new Error(`fetch ${url} failed: ${res.status} ${res.statusText}`);
-  }
-  return await res.text();
-}
-
-function parseListings(html) {
-  const $ = cheerio.load(html);
-  const out = [];
-
-  // The site markup can change. This targets common card patterns.
-  $('.card, .sale-card, .item, .listing, .sale').each((_, el) => {
-    const $el = $(el);
-
-    // title
-    const title =
-      $el.find('h2, .card-title, .title, .sale-title').first().text().trim() ||
-      $el.find('a').first().text().trim();
-
-    // address/city/state/zip often live together; split heuristically
-    const addrText =
-      $el.find('.address, .location, .sale-location').first().text().trim();
-
-    // Dates / times are all over the place; capture as a single string
-    const dateText =
-      $el.find('.dates, .sale-dates, time').first().text().trim() ||
-      $el.find('.card-body').text().trim();
-
-    // Try to extract a detail link (often contains the sale id)
-    let href =
-      $el.find('a[href*="/estate-sales/"]').attr('href') ||
-      $el.find('a[href*="/sales/"]').attr('href') ||
-      $el.find('a').attr('href');
-    if (href && href.startsWith('/')) {
-      href = `https://www.estatesales.net${href}`;
+    {
+      title: 'Railway Worker Test Sale 2',
+      address: '456 Worker Ave',
+      city: 'Palmdale',
+      state: 'CA',
+      zip: '93550',
+      lat: 34.58,
+      lng: -118.10,
+      distanceMi: 4.2,
+      hours: { sat: '09:00–15:00' },
+      startsAt: new Date(now + 48 * 3600 * 1000).toISOString(),
+      endsAt:   new Date(now + 48 * 3600 * 1000 + 6 * 3600 * 1000).toISOString(),
+      directionsUrl: 'https://www.google.com/maps?q=456+Worker+Ave,+Palmdale,+CA+93550',
+      sourceId: 'esn-mock-002'
     }
+  ];
 
-    // Attempt to derive a source_id from URL (numbers in path)
-    let sourceId = null;
-    if (href) {
-      const m = href.match(/(\d{5,})/);
-      if (m) sourceId = m[1];
-    }
-
-    // Split address line if present
-    let address = null, city = null, state = null, zip = null;
-    if (addrText) {
-      // Example patterns: "123 Main St, Palmdale, CA 93552"
-      const parts = addrText.split(',').map(s => s.trim());
-      if (parts.length >= 2) {
-        address = parts[0] || null;
-        const cityStateZip = parts.slice(1).join(', ');
-        const m = cityStateZip.match(/^([^,]+),\s*([A-Z]{2})\s*(\d{5})?/i);
-        if (m) {
-          city = m[1]?.trim() || null;
-          state = m[2]?.trim().toUpperCase() || null;
-          zip = m[3]?.trim() || null;
-        } else {
-          // fallback—just put the remainder in city
-          city = cityStateZip || null;
-        }
-      } else {
-        address = addrText;
-      }
-    }
-
-    // Dates: leave raw; the index.js will store as text in `hours` if we can’t parse
-    let start_date = null;
-    let end_date = null;
-    let hours = dateText || null;
-
-    out.push({
-      id: sourceId,
-      title,
-      address,
-      city,
-      state,
-      zip,
-      start_date,
-      end_date,
-      hours,
-      url: href || null,
-    });
-  });
-
-  return out.filter(x => x.title || x.address || x.city);
-}
-
-async function searchEstateSalesNet({ zip, radiusMi }) {
-  const url = buildUrl({ zip, radiusMi });
-  console.log('🔗 estatesales.net url:', url);
-
-  try {
-    const html = await fetchHtml(url);
-    const rows = parseListings(html);
-    console.log(`🔍 estatesales.net parsed ${rows.length} rows`);
-    // Be nice if we need to page or fetch more
-    await sleep(500);
-    return rows;
-  } catch (err) {
-    console.error('estatesales.net fetch/parse error:', err?.message || err);
-    return [];
-  }
+  console.log(`[esn] returning ${base.length} mock listings`);
+  return base;
 }
 
 module.exports = { searchEstateSalesNet };

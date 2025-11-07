@@ -1,107 +1,104 @@
-// index.js — fetch real listings and upsert into Supabase (with verbose logging)
+// index.js — fetch listings and upsert into Supabase (with loud logs)
+console.log(">>> STARTING estate-radar-worker <<<");
 
-const { createClient } = require('@supabase/supabase-js');
-const dayjs = require('dayjs');
-const { searchEstateSalesNet } = require('./sources/estatesalesnet');
+const { createClient } = require("@supabase/supabase-js");
+const dayjs = require("dayjs");
+const { searchEstateSalesNet } = require("./sources/estatesalesnet");
 
+// --- env helpers -------------------------------------------------------------
 function need(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
-const SUPABASE_URL = need('SUPABASE_URL');
-const SERVICE_KEY  = need('SUPABASE_SERVICE_ROLE_KEY');
+const SUPABASE_URL = need("SUPABASE_URL");
+const SERVICE_KEY = need("SUPABASE_SERVICE_ROLE_KEY"); // service role for server-side writes
+
+// Admin client (server-side)
 const supabase = createClient(SUPABASE_URL, SERVICE_KEY);
 
-// ---- config for this run ----
-const ZIP       = '93552';
+// --- run configuration -------------------------------------------------------
+const ZIP = "93552";
 const RADIUS_MI = 50;
-const HOME_BASE = '36304 52nd St E, Palmdale, CA 93552';
+const HOME_BASE = "36304 52nd St E, Palmdale, CA 93552";
 
-// ---- helpers ---------------------------------------------------------------
+// --- tiny logger that writes to 'runs' table if available --------------------
 async function logRun(status, notes) {
   try {
-    await supabase.from('runs').insert({ status, notes });
-  } catch (err) {
-    console.error('[runs] insert failed:', err.message);
+    await supabase.from("runs").insert({ status, notes });
+  } catch (e) {
+    // don't crash on log failures
   }
 }
 
-function pretty(obj) {
-  return JSON.stringify(obj, null, 2);
+// --- upsert helper -----------------------------------------------------------
+async function upsertSales(rows) {
+  // Expect the 'sales' table to have columns like:
+  // id (bigint identity), title text, address text, city text, state text,
+  // created_at timestamptz default now(), hours_json jsonb, directions_url text, distance_mi float8
+  // If you added a unique constraint, set onConflict to those columns.
+  const { data, error } = await supabase
+    .from("sales")
+    .upsert(rows, { ignoreDuplicates: false }) // change to { onConflict: 'title,address' } if you add a constraint
+    .select();
+
+  if (error) throw error;
+  return data ?? [];
 }
 
-// ---- main ------------------------------------------------------------------
+// --- main --------------------------------------------------------------------
 (async () => {
-  console.log('=== Worker starting at', new Date().toISOString(), '===');
-  console.log('Config:', { ZIP, RADIUS_MI, HOME_BASE });
+  const startTs = Date.now();
+  console.log(
+    `[${new Date().toISOString()}] Worker starting… ZIP=${ZIP} radius=${RADIUS_MI}mi`
+  );
 
-  await logRun('starting', `zip=${ZIP}, radius=${RADIUS_MI}`);
-
-  let results;
   try {
-    results = await searchEstateSalesNet({
+    // 1) Fetch listings (mock or real scraper inside sources/)
+    const listings = await searchEstateSalesNet({
       zip: ZIP,
-      radiusMiles: RADIUS_MI,
+      radiusMi: RADIUS_MI,
       homeBase: HOME_BASE,
-      maxPages: 1,          // you can bump this later
-      fetchTimeoutMs: 20000 // safety timeout
     });
-  } catch (err) {
-    console.error('[fetch] failed:', err.stack || err.message || err);
-    await logRun('error', `fetch failed: ${err.message}`);
-    process.exit(1);
-  }
 
-  if (!results || !Array.isArray(results) || results.length === 0) {
-    console.warn('[fetch] no listings returned');
-    await logRun('done', '0 listings (no-op)');
-    console.log('=== Worker done (no data) ===');
-    process.exit(0);
-  }
+    console.log(`Fetched ${listings.length} listing(s) from sources.`);
 
-  console.log(`[fetch] got ${results.length} raw listings`);
-  // Normalize rows for Supabase
-  const rows = results.map((r) => {
-    return {
-      title: r.title || null,
-      address: r.address || null,
-      city: r.city || null,
-      state: r.state || null,
-      zip: r.zip || null,
-      lat: r.lat ?? null,
-      lng: r.lng ?? null,
-      distance_mi: r.distanceMi ?? null,
-      hours_json: r.hours ? JSON.stringify(r.hours) : null,
-      starts_at: r.startsAt ? new Date(r.startsAt).toISOString() : null,
-      ends_at: r.endsAt ? new Date(r.endsAt).toISOString() : null,
-      directions_url: r.directionsUrl || null,
-      source: 'estatesales.net',
-      source_id: r.sourceId || null,
-      created_at: new Date().toISOString()
-    };
-  });
+    if (!Array.isArray(listings) || listings.length === 0) {
+      await logRun("ok", "No listings found.");
+      console.log("No listings to upsert. Exiting.");
+      process.exit(0);
+      return;
+    }
 
-  console.log(`[upsert] preparing to upsert ${rows.length} rows`);
-  // Show a small sample to verify shape
-  console.log('[upsert] sample row:', pretty(rows[0]));
+    // 2) Prepare rows for DB
+    const rows = listings.map((x) => ({
+      title: x.title,
+      address: x.address,
+      city: x.city,
+      state: x.state,
+      directions_url: x.directionsUrl,
+      hours_json: x.hoursJson ?? null,
+      distance_mi: x.distanceMi ?? null,
+      // let created_at default to now() on the DB side
+    }));
 
-  try {
-    // upsert on (source, source_id) to avoid duplicates
-    const { error } = await supabase
-      .from('sales')
-      .upsert(rows, { onConflict: 'source,source_id' });
+    // 3) Upsert
+    const inserted = await upsertSales(rows);
+    console.log(
+      `Upsert complete: ${inserted.length} row(s). First:`,
+      inserted[0] ? inserted[0].title : "(none)"
+    );
 
-    if (error) throw error;
-
-    console.log('[upsert] success');
-    await logRun('done', `upserted=${rows.length}`);
-    console.log('=== Worker done OK ===');
+    await logRun("ok", `Inserted ${inserted.length} row(s)`);
+    console.log(
+      `Done in ${Math.round((Date.now() - startTs) / 1000)}s — exiting.`
+    );
     process.exit(0);
   } catch (err) {
-    console.error('[upsert] failed:', err.stack || err.message || err);
-    await logRun('error', `upsert failed: ${err.message}`);
+    console.error("ERROR:", err?.message || err);
+    await logRun("error", String(err?.message || err));
+    // Non-zero exit so Railway shows a red run if something blew up
     process.exit(1);
   }
 })();

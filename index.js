@@ -1,105 +1,103 @@
-// index.js — fetch real listings and upsert into Supabase (with strong logging)
+// index.js — fetch real listings and upsert into Supabase (debug build)
+
+// ---- loud global error handlers -------------------------------------------
+process.on('unhandledRejection', (err) => {
+  console.error('[FATAL] Unhandled Promise rejection:', err && err.stack || err);
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err && err.stack || err);
+  process.exit(1);
+});
+
+console.log('== Worker booting ==', new Date().toISOString());
 
 const { createClient } = require('@supabase/supabase-js');
 const dayjs = require('dayjs');
 const { searchEstateSalesNet } = require('./sources/estatesalesnet');
 
-// --- small helper to require envs clearly ---
+// ---- env helpers -----------------------------------------------------------
 function need(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
+  if (!v) {
+    console.error(`[ENV] Missing env var: ${name}`);
+    throw new Error(`Missing env var: ${name}`);
+  }
   return v;
 }
 
-// --- env + supabase client (service key) ---
+// ---- config/env ------------------------------------------------------------
 const SUPABASE_URL = need('SUPABASE_URL');
 const SERVICE_KEY  = need('SUPABASE_SERVICE_ROLE_KEY');
 const supabase = createClient(SUPABASE_URL, SERVICE_KEY);
-console.log('ER worker boot', new Date().toISOString());
-await supabase.from('runs').insert({ status: 'boot', notes: 'reached top of worker' });
 
-// --- run config ---
-const ZIP = '93552';
+// run configuration
+const ZIP       = '93552';
 const RADIUS_MI = 50;
 const HOME_BASE = '36304 52nd St E, Palmdale, CA 93552';
 
-// --- small logging helpers ---
+// ---- db helpers ------------------------------------------------------------
 async function logRun(status, notes) {
   try {
-    await supabase.from('runs').insert({ status, notes });
-  } catch (_) {}
-}
-function log(...args) {
-  console.log(...args);
-}
-
-// --- upsert into sales table ---
-async function upsertSales(rows) {
-  if (!Array.isArray(rows)) rows = [];
-  if (!rows.length) return { inserted: 0, updated: 0 };
-
-  // Map inbound rows to our table shape. Accepted fields:
-  // source, source_id, title, address, city, state, zip, start_date, end_date, hours, lat, lng
-  const mapped = rows.map(r => ({
-    source: 'estatesales.net',
-    source_id: r.id || r.source_id || null,
-    title: r.title || '(no title)',
-    address: r.address || null,
-    city: r.city || null,
-    state: r.state || 'CA',
-    zip: r.zip || null,
-    start_date: r.start_date ? new Date(r.start_date) : null,
-    end_date: r.end_date ? new Date(r.end_date) : null,
-    hours: r.hours || null,
-    lat: r.lat ?? null,
-    lng: r.lng ?? null,
-  }));
-
-  // Upsert on (source, source_id) so we don’t duplicate the same listing
-  const { data, error, status } = await supabase
-    .from('sales')
-    .upsert(mapped, { onConflict: 'source,source_id' })
-    .select();
-
-  if (error) throw error;
-
-  // Heuristic for inserted/updated counts (PostgREST doesn’t separate them for upsert)
-  const affected = Array.isArray(data) ? data.length : 0;
-  return { inserted: affected, updated: 0, status };
+    await supabase.from('runs').insert({
+      status,
+      notes,
+      started_at: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error('[runs] insert failed:', e);
+  }
 }
 
-// --- main ---
-(async () => {
-  const startedAt = new Date();
-  log('🚀 Worker starting (real fetch)…');
-  log(`📍 Home base: ${HOME_BASE}`);
-  log(`🔎 ZIP: ${ZIP}  Radius: ${RADIUS_MI} mi`);
+// ---- main ------------------------------------------------------------------
+(async function main() {
+  console.log('[main] starting run…');
+  const startedAt = Date.now();
 
   try {
-    log('🌐 Fetching listings from estatesales.net…');
-    const results = await searchEstateSalesNet({ zip: ZIP, radiusMi: RADIUS_MI });
+    // sanity check DB connectivity
+    console.log('[db] ping: selecting 1 from runs…');
+    await supabase.from('runs').select('id').limit(1);
+    console.log('[db] ping ok.');
 
-    const n = Array.isArray(results) ? results.length : 0;
-    log(`📦 Fetched ${n} listings`);
+    // fetch from estatesales.net (scraper/source module)
+    console.log('[fetch] estatesales.net search starting…', { ZIP, RADIUS_MI });
+    const sales = await searchEstateSalesNet({
+      zip: ZIP,
+      radiusMi: RADIUS_MI,
+      homeBase: HOME_BASE
+    });
 
-    if (!n) {
-      await logRun('ok', `no_results: ${ZIP} within ${RADIUS_MI}mi`);
-      log('ℹ️ No results to upsert. Exiting cleanly.');
+    const count = Array.isArray(sales) ? sales.length : 0;
+    console.log(`[fetch] got ${count} sales.`);
+
+    if (!Array.isArray(sales)) {
+      throw new Error('searchEstateSalesNet returned non-array result');
+    }
+
+    if (sales.length === 0) {
+      console.warn('[fetch] no results; logging run and exiting.');
+      await logRun('ok', '0 results');
+      console.log('== Worker done (no results) ==', (Date.now() - startedAt) + 'ms');
       return;
     }
 
-    log('📝 Upserting into Supabase…');
-    const { inserted, updated } = await upsertSales(results);
+    // upsert into Supabase
+    console.log('[upsert] writing to supabase…');
+    const { error } = await supabase
+      .from('sales')
+      .upsert(sales, { onConflict: 'id' }); // assumes 'id' is unique key in your table
+    if (error) {
+      console.error('[upsert] error:', error);
+      throw error;
+    }
 
-    const doneNote = `inserted=${inserted}, updated=${updated}`;
-    await logRun('ok', doneNote);
-
-    const ms = Date.now() - startedAt.getTime();
-    log(`✅ Ingest complete — ${doneNote}  (${ms}ms)`);
+    await logRun('ok', `inserted/upserted ${sales.length}`);
+    console.log('[upsert] done.');
+    console.log('== Worker done (success) ==', (Date.now() - startedAt) + 'ms');
   } catch (err) {
-    const msg = err?.message || String(err);
-    await logRun('error', msg);
-    console.error('❌ Worker error:', err);
-    process.exitCode = 1;
+    console.error('[main] FAILED:', err && err.stack || err);
+    await logRun('error', String(err && err.message || err));
+    process.exit(1);
   }
 })();

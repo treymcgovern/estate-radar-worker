@@ -15,6 +15,8 @@ function need(name) {
 const SUPABASE_URL = need('SUPABASE_URL');
 const SERVICE_KEY  = need('SUPABASE_SERVICE_ROLE_KEY');
 const supabase = createClient(SUPABASE_URL, SERVICE_KEY);
+console.log('ER worker boot', new Date().toISOString());
+await supabase.from('runs').insert({ status: 'boot', notes: 'reached top of worker' });
 
 // --- run config ---
 const ZIP = '93552';

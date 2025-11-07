@@ -1,104 +1,103 @@
-// index.js — fetch real listings and upsert into Supabase
+// index.js — fetch real listings and upsert into Supabase (with strong logging)
 
 const { createClient } = require('@supabase/supabase-js');
 const dayjs = require('dayjs');
 const { searchEstateSalesNet } = require('./sources/estatesalesnet');
 
+// --- small helper to require envs clearly ---
 function need(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
+// --- env + supabase client (service key) ---
 const SUPABASE_URL = need('SUPABASE_URL');
 const SERVICE_KEY  = need('SUPABASE_SERVICE_ROLE_KEY');
 const supabase = createClient(SUPABASE_URL, SERVICE_KEY);
 
-// ---- config for this run ----
+// --- run config ---
 const ZIP = '93552';
 const RADIUS_MI = 50;
 const HOME_BASE = '36304 52nd St E, Palmdale, CA 93552';
 
-// ---- helpers -------------------------------------------------
+// --- small logging helpers ---
 async function logRun(status, notes) {
-  try { await supabase.from('runs').insert({ status, notes }); } catch {}
+  try {
+    await supabase.from('runs').insert({ status, notes });
+  } catch (_) {}
+}
+function log(...args) {
+  console.log(...args);
 }
 
-// Upsert by natural key (title + address [+ start_at if present])
-async function upsertSale(item) {
-  // shape guard
-  const payload = {
-    title: item.title?.trim() || 'Untitled Estate Sale',
-    address: item.address || '',
-    city: item.city || null,
-    start_at: item.start_at || null,
-    end_at: item.end_at || null,
-    hours_json: item.hours_json || null,
-    distance_mi: item.distance_mi ?? null,
-    directions_url: item.directions_url || null,
-    source: item.source || 'estatesales.net',
-  };
+// --- upsert into sales table ---
+async function upsertSales(rows) {
+  if (!Array.isArray(rows)) rows = [];
+  if (!rows.length) return { inserted: 0, updated: 0 };
 
-  // look for an existing row
-  let q = supabase
+  // Map inbound rows to our table shape. Accepted fields:
+  // source, source_id, title, address, city, state, zip, start_date, end_date, hours, lat, lng
+  const mapped = rows.map(r => ({
+    source: 'estatesales.net',
+    source_id: r.id || r.source_id || null,
+    title: r.title || '(no title)',
+    address: r.address || null,
+    city: r.city || null,
+    state: r.state || 'CA',
+    zip: r.zip || null,
+    start_date: r.start_date ? new Date(r.start_date) : null,
+    end_date: r.end_date ? new Date(r.end_date) : null,
+    hours: r.hours || null,
+    lat: r.lat ?? null,
+    lng: r.lng ?? null,
+  }));
+
+  // Upsert on (source, source_id) so we don’t duplicate the same listing
+  const { data, error, status } = await supabase
     .from('sales')
-    .select('id')
-    .eq('title', payload.title)
-    .eq('address', payload.address)
-    .limit(1);
+    .upsert(mapped, { onConflict: 'source,source_id' })
+    .select();
 
-  if (payload.start_at) {
-    q = q.eq('start_at', payload.start_at);
-  }
+  if (error) throw error;
 
-  const { data: existing, error: selErr } = await q;
-  if (selErr) throw selErr;
-
-  if (existing && existing.length) {
-    const id = existing[0].id;
-    const { error } = await supabase.from('sales').update(payload).eq('id', id);
-    if (error) throw error;
-    return { action: 'update', id };
-  } else {
-    const { data, error } = await supabase.from('sales').insert(payload).select('id').limit(1);
-    if (error) throw error;
-    return { action: 'insert', id: data?.[0]?.id };
-  }
+  // Heuristic for inserted/updated counts (PostgREST doesn’t separate them for upsert)
+  const affected = Array.isArray(data) ? data.length : 0;
+  return { inserted: affected, updated: 0, status };
 }
 
-// ---- main ----------------------------------------------------
-async function main() {
-  console.log('🚀 Worker starting (real fetch)…');
-  await logRun('running', `ingest start zip=${ZIP} r=${RADIUS_MI}`);
+// --- main ---
+(async () => {
+  const startedAt = new Date();
+  log('🚀 Worker starting (real fetch)…');
+  log(`📍 Home base: ${HOME_BASE}`);
+  log(`🔎 ZIP: ${ZIP}  Radius: ${RADIUS_MI} mi`);
 
-  // 1) fetch from EstateSales.net (HTML parse)
-  const items = await searchEstateSalesNet({
-    zip: ZIP,
-    radiusMiles: RADIUS_MI,
-    pages: 2,
-    homeBase: HOME_BASE,
-  });
+  try {
+    log('🌐 Fetching listings from estatesales.net…');
+    const results = await searchEstateSalesNet({ zip: ZIP, radiusMi: RADIUS_MI });
 
-  // 2) write into Supabase
-  let inserts = 0, updates = 0, errors = 0;
-  for (const it of items) {
-    try {
-      const res = await upsertSale(it);
-      if (res.action === 'insert') inserts++;
-      else updates++;
-    } catch (e) {
-      errors++;
-      console.error('upsert error:', e.message, it?.title);
+    const n = Array.isArray(results) ? results.length : 0;
+    log(`📦 Fetched ${n} listings`);
+
+    if (!n) {
+      await logRun('ok', `no_results: ${ZIP} within ${RADIUS_MI}mi`);
+      log('ℹ️ No results to upsert. Exiting cleanly.');
+      return;
     }
+
+    log('📝 Upserting into Supabase…');
+    const { inserted, updated } = await upsertSales(results);
+
+    const doneNote = `inserted=${inserted}, updated=${updated}`;
+    await logRun('ok', doneNote);
+
+    const ms = Date.now() - startedAt.getTime();
+    log(`✅ Ingest complete — ${doneNote}  (${ms}ms)`);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    await logRun('error', msg);
+    console.error('❌ Worker error:', err);
+    process.exitCode = 1;
   }
-
-  const summary = `done: ${items.length} fetched, ${inserts} inserted, ${updates} updated, ${errors} errors`;
-  await logRun('success', summary);
-  console.log('✅ Ingest complete —', summary);
-}
-
-main().catch(async (e) => {
-  console.error('❌ Ingest failed:', e.message);
-  await logRun('failed', e.message);
-  process.exit(1);
-});
+})();

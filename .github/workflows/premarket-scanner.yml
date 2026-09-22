@@ -1,0 +1,62 @@
+name: Premarket Stock Scanner
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Generate report without email
+        required: false
+        default: "false"
+  schedule:
+    - cron: "50 10 * * 1-5"
+    - cron: "50 11 * * 1-5"
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Pacific run window
+        id: pacific
+        shell: bash
+        run: |
+          HOUR=$(TZ=America/Los_Angeles date +%H)
+          DAY=$(TZ=America/Los_Angeles date +%u)
+          if [ "$DAY" -le 5 ] && [ "$HOUR" = "03" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.pacific.outputs.run == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.pacific.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: premarket-scanner/requirements.txt
+      - name: Install
+        if: steps.pacific.outputs.run == 'true'
+        run: pip install -r premarket-scanner/requirements.txt
+      - name: Scan
+        if: steps.pacific.outputs.run == 'true'
+        working-directory: premarket-scanner
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          PRICE_MIN: "0.10"
+          PRICE_MAX: "1.00"
+          MIN_PREMARKET_PCT: "5"
+          MIN_PREMARKET_VOLUME: "1000000"
+        run: python scanner.py
+      - name: Upload results
+        if: always() && steps.pacific.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: premarket-scan-${{ github.run_id }}
+          path: premarket-scanner/premarket_results.csv
+          if-no-files-found: ignore
+          retention-days: 30
